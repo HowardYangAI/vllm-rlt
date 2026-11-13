@@ -65,7 +65,11 @@ class StageEngine:
             required_layout = getattr(model, "kv_cache_layout", "last_exited")
             if cache_config.layout != required_layout:
                 raise ValueError(f"boundary-KV models require {required_layout} KV")
-            if cache_config.enable_prefix_caching:
+            # Only models that verified hit/miss parity opt in: the cache must
+            # cover boundary KV at depth 0 and recurrent KV at every depth.
+            if cache_config.enable_prefix_caching and not getattr(
+                model, "supports_boundary_prefix_caching", False
+            ):
                 raise ValueError("boundary-KV prefix caching is not yet supported")
         self.exit_config = exit_config or ExitConfig()
         self.execution_config = resolve_cuda_graph_rows(

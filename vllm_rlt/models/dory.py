@@ -487,6 +487,9 @@ class DoryForCausalLM(nn.Module):
     supports_cuda_graphs = False
     # Selection must reject a backend that would silently attend full history.
     requires_sliding_window = True
+    # Complete-state prefix reuse: boundary KV is published from depth 0 and
+    # recurrent KV from every depth. Prefix caching requires per_loop KV.
+    supports_boundary_prefix_caching = True
 
     def __init__(self, config: DoryConfig) -> None:
         super().__init__()

@@ -112,12 +112,13 @@ logical-page map, with `-1` for reclaimed pages. Here `cache` is
 reclaimed full prefix is rejected; these queries do not retain page references
 or expose mutable allocator state.
 
-Grouped prefix publish, lookup and import remain unsupported. A future prefix
-consumer must retain pages through the same manager before publishing them or
-allowing their request owner to reclaim them. Reclamation drops the owner's
-references; a page becomes reusable only when its final reference reaches zero.
-The inspection methods are not a pin API, and no public grouped retain/pin
-interface is provided yet.
+Grouped prefix caching publishes one entry per token page holding every
+owned (group, plane, layer) page, ordered as the allocator splits a claim.
+The entry takes its own reference, so the publishing request can finish or
+release its pages without freeing the cached ones. Publication stops at the
+first token page with any owned page missing. Prefix caching together with
+`reclaim_swa` is rejected until hit-path reclamation is qualified. The
+inspection methods are not a pin API.
 
 ## Supported today
 
@@ -130,6 +131,16 @@ interface is provided yet.
 - `loops=` at load time to fix 1, 2 or 4 loops.
 - Greedy and sampled decoding, request seeds, EOS (`2`, `11`) and length
   stopping through the existing engine.
+- Prefix caching (`enable_prefix_caching=True`) in `per_loop` mode. A
+  published page carries boundary KV from plane 0 and recurrent KV from every
+  plane; boundary layers never write deeper planes, so they are not required
+  there. A hit restores exactly that coverage and the scheduler resumes prefill
+  from the cached offset. `last_loop` keeps one shared plane and stays rejected.
+  Prefix keys hash tokens only. That is sound because the loop count is fixed
+  when the model loads and the layout is fixed by `CacheConfig`, and each
+  engine owns its own KV manager, so pages from different loop counts or
+  layouts never share a cache. A cache shared across loop counts would have to
+  add both to the key. Evicted prefixes fall back to a full cold prefill.
 
 ## Rejected today
 
@@ -137,7 +148,7 @@ These fail fast rather than degrade silently:
 
 - WCPB, mixed or staged prefill; asynchronous execution; PD.
 - CUDA Graphs (the sliding-window path needs host-planned KV metadata).
-- Prefix caching.
+- Prefix caching in `last_loop` mode.
 - Preemption and native-cache snapshot/restore.
 - Self-speculation.
 - Per-request loop counts other than the configured full depth: Dory has no
@@ -159,6 +170,14 @@ single-file and sharded checkpoints, stage/KV contracts, sliding-window masking,
 engine scheduling, and numerical agreement with an independent dense oracle
 (`tests/reference/dory.py`) for both KV modes — including a greedy generation
 comparison against that oracle.
+Prefix reuse is checked at loops 1, 2 and 4: cold and cache-hit prefill
+logits match the oracle, cached prefixes longer than the sliding window,
+block-aligned prompts, diverging suffixes, concurrent sharers and a
+re-request after its prefix was evicted all reproduce the cold greedy tokens,
+and publication refuses pages missing any owned plane.
+
+Prefix pages stay pinned for the life of the cache entry. Prefix tests run on
+both the legacy all-layer blocks and grouped storage.
 
 The current grouped integration is covered by tiny FP32 CPU numerical and
 multi-request lifecycle tests for both KV modes, including independent dense
