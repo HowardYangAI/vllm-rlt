@@ -61,13 +61,71 @@ count (`DoryConfig.num_kv_layers`), not by all 72 physical sublayers, and
 declares one. Attention layers therefore reach the cache through a packed
 layer id rather than their physical sublayer index.
 
+## Grouped storage and optional SWA reclamation
+
+Dory uses one pool of attention-layer pages, grouped by window policy and
+boundary/recurrent plane domain. `reclaim_swa` defaults to `False`. To return
+expired sliding-window pages to the pool, enable it together with incremental
+allocation on an already loaded model:
+
+```python
+from vllm_rlt import CacheConfig
+from vllm_rlt.config import ExecutionConfig
+from vllm_rlt.engine.llm_engine import LLMEngine
+
+engine = LLMEngine(
+    model,
+    attention_backend="torch",
+    execution_config=ExecutionConfig(use_uva=False),
+    cache_config=CacheConfig(
+        num_blocks=256,
+        layout=model.kv_cache_layout,
+        incremental_allocation=True,
+        reclaim_swa=True,
+    ),
+)
+```
+
+`num_blocks` preserves the existing all-layer KV byte budget: the native pool
+converts it to `num_blocks * model.config.num_kv_layers` single-layer pages.
+Reclamation supports ordinary synchronous fixed-loop `ouro` execution. Each
+`per_loop` plane advances independently; shared recurrent history in
+`last_loop` advances only after the token's final loop. Pages retire only after
+all layers in their group have consumed the range and the submission completes.
+Full-attention history remains resident.
+
+Native SWA attention stages only the needed page-aligned read span. Logical token
+positions, write addresses and public layer maps remain absolute; the backend's
+read-table context lengths are local to that span. Native attention calls must
+match the layer's declared window, including `None` for full-attention layers.
+
+For read-only group policy, `cache.layer_group(kv_layer_id)` returns
+`(group_id, policy)`: a manager-local group ID and the immutable `KVGroup` with
+compact layer IDs, window, recurrent domain and plane count. The layer ID is a
+compact KV index, not a physical sublayer index.
+
+For read-only cache inspection, `cache.retained_range(request_id, kv_layer_id,
+depth)` returns `(resident_start, written_end)` in absolute token positions.
+`cache.layer_block_table(request_id, kv_layer_id, depth)` returns the absolute
+logical-page map, with `-1` for reclaimed pages. Here `cache` is
+`engine.cache_manager`, and `kv_layer_id` is a compact KV index. Reading a
+reclaimed full prefix is rejected; these queries do not retain page references
+or expose mutable allocator state.
+
+Grouped prefix publish, lookup and import remain unsupported. A future prefix
+consumer must retain pages through the same manager before publishing them or
+allowing their request owner to reclaim them. Reclamation drops the owner's
+references; a page becomes reusable only when its final reference reaches zero.
+The inspection methods are not a pin API, and no public grouped retain/pin
+interface is provided yet.
+
 ## Supported today
 
 - Native strict safetensors loading with the artifact's per-projection key
   names (`q/k/v/g/o_proj`, `gate_proj`/`up_proj`) and the learned scale tensors.
   There is no fused-key remapping: a checkpoint that packs `qkv_proj` or
   `gate_up_proj` fails loudly instead of loading approximately.
-- Synchronous eager execution: full-prompt prefill followed by ordinary token
+- Synchronous eager execution: ordinary bounded-chunk prefill followed by token
   decoding, with the configured fixed loop count.
 - `loops=` at load time to fix 1, 2 or 4 loops.
 - Greedy and sampled decoding, request seeds, EOS (`2`, `11`) and length
@@ -80,23 +138,19 @@ These fail fast rather than degrade silently:
 - WCPB, mixed or staged prefill; asynchronous execution; PD.
 - CUDA Graphs (the sliding-window path needs host-planned KV metadata).
 - Prefix caching.
+- Preemption and native-cache snapshot/restore.
 - Self-speculation.
 - Per-request loop counts other than the configured full depth: Dory has no
   trained exit gate, so the runtime refuses to invent one, including via
   `min_loops` with `exit_threshold=0`.
-
-Preemption and snapshots are **not qualified** rather than enforced: the
-generic KV snapshot mechanism copies every plane, so it may well work, but no
-restoration test exists for Dory's boundary state. Keep `enable_preemption`
-off until 2E covers it.
 
 Sliding-window masking is implemented in the **Torch reference attention
 backend** only (`window=` on `KVCacheManager.attend`), and backend selection now
 requires the `sliding_window` capability, so a Dory engine on Triton/Flash fails
 at construction instead of mid-request. The reference kernel is a Python loop
 over rows: correct, but slow enough that it distorts memory-profiling wall time.
-Adding windowed Triton/Flash kernels and SWA storage reclamation is follow-up
-work.
+Windowed Triton/Flash kernels remain follow-up work. Optional physical SWA page
+reclamation is available on the grouped Torch path described above.
 
 ## Validation status
 
@@ -106,12 +160,18 @@ engine scheduling, and numerical agreement with an independent dense oracle
 (`tests/reference/dory.py`) for both KV modes — including a greedy generation
 comparison against that oracle.
 
+The current grouped integration is covered by tiny FP32 CPU numerical and
+multi-request lifecycle tests for both KV modes, including independent dense
+logits, page reuse, cancellation and cleanup. GPU/backend and real-checkpoint
+qualification remain separate follow-up work.
+
 Not yet performed, and required before claiming support:
 
 - Real-checkpoint BF16 comparison with the pinned upstream implementation
   (logits, generated outputs, stopping) at 1, 2 and 4 loops.
-- GPU execution; every validated path today is CPU `torch` attention, and
-  `plan_cache`'s CUDA profiling branch is therefore also unexercised for Dory.
+- Automatic CUDA memory profiling: `plan_cache`'s CUDA profiling branch remains
+  unexercised for Dory; current grouped checks use an explicit KV capacity.
 - Long-context behaviour beyond the tested lengths; the artifact's 256K context
   is a configuration limit, not a qualified deployment length.
-- Performance measurement. No throughput or memory claim is made here.
+- Performance and GPU allocator-peak memory measurement. Request-held KV page
+  accounting does not measure either.
