@@ -171,8 +171,8 @@ class KVCacheManager:
         self.groups = ()
         self.layer_groups = {}
         if self.grouped:
-            if enable_prefix_caching:
-                raise NotImplementedError("grouped KV does not support prefix caching")
+            if enable_prefix_caching and reclaim_swa:
+                raise NotImplementedError("prefix caching with SWA reclamation is not qualified")
             policies = dict(layer_windows)
             if not policies or any(
                 type(layer) is not int or not 0 <= layer < num_layers for layer in policies
@@ -336,14 +336,52 @@ class KVCacheManager:
             if key in self._prefixes:
                 continue
             end = (index + 1) * self.block_size
-            # Every depth and layer must have a contiguous written prefix.
-            # GPU completion alone does not establish this coverage.
-            if any(w.prefix < end for plane in allocation.written for w in plane):
+            # Every layer that attention reads must have a contiguous written
+            # prefix. GPU completion alone does not establish this coverage.
+            if any(
+                written.prefix < end
+                for plane, layers in enumerate(allocation.written)
+                for layer, written in enumerate(layers)
+                if self._plane_owns(plane, layer)
+            ):
                 break
-            blocks = tuple(t[index] for t in allocation.block_tables)
+            blocks = self._prefix_page(allocation, index)
+            if blocks is None:
+                break
             for b in blocks:
                 self._refs[b] += 1
             self._prefixes[key] = blocks
+
+    def _prefix_page(self, allocation, index):
+        """Every physical page holding token page ``index``, or None if any is gone.
+
+        Grouped entries are flattened group -> plane -> layer, the order
+        ``_group_tables`` uses to split one page's claim back into bundles.
+        """
+        if not self.grouped:
+            return tuple(t[index] for t in allocation.block_tables)
+        bundles = [
+            table[index] if index < len(table) else None
+            for planes in allocation.group_tables
+            for table in planes
+        ]
+        if any(bundle is None for bundle in bundles):
+            return None
+        return tuple(b for bundle in bundles for b in bundle)
+
+    def _plane_owns(self, plane: int, layer: int) -> bool:
+        """Whether ``layer`` keeps KV history in ``plane``.
+
+        Boundary (non-recurrent) layers run once per token, at depth 0, so
+        they only ever write plane 0. Recurrent layers own every plane.
+        Grouped storage takes ownership from the layer's group policy.
+        """
+        if self.grouped:
+            if layer not in self.layer_groups:
+                return False
+            group_id, _ = self.layer_groups[layer]
+            return plane == 0 or self.groups[group_id].recurrent
+        return plane == 0 or layer in self.recurrent_layers
 
     def lookup_prefix(self, tokens):
         if not self.enable_prefix_caching:
@@ -379,19 +417,34 @@ class KVCacheManager:
             raise ValueError("invalid initial KV frontier")
         pages = (initial_tokens + self.block_size - 1) // self.block_size
         if self.grouped:
-            if prefix:
-                raise NotImplementedError("grouped KV does not support prefix imports")
-            fresh = self._claim(pages * self.pages_per_token_block)
+            if len(prefix) > pages:
+                raise ValueError("prefix exceeds initial KV frontier")
+            claimed = [b for page in prefix for b in page]
+            for b in claimed:
+                self._refs[b] += 1
+            fresh = self._claim((pages - len(prefix)) * self.pages_per_token_block)
             if fresh is None:
+                self._drop_refs(claimed)
                 return False
+            tables = self._group_tables(fresh, pages - len(prefix))
+            for page in reversed(prefix):
+                head = self._group_tables(page, 1)
+                tables = tuple(
+                    tuple(h + t for h, t in zip(head_planes, planes))
+                    for head_planes, planes in zip(head, tables)
+                )
+            length = len(prefix) * self.block_size
             self._allocations[request_id] = _Allocation(
                 int(max_tokens),
                 (),
                 [
-                    [_WrittenPositions() for _ in range(self.num_layers)]
-                    for _ in range(self.storage_depths)
+                    [
+                        _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
+                        for layer in range(self.num_layers)
+                    ]
+                    for plane in range(self.storage_depths)
                 ],
-                group_tables=self._group_tables(fresh, pages),
+                group_tables=tables,
                 group_epochs=[[0] * group.planes for group in self.groups],
                 retired_pages=[[0] * group.planes for group in self.groups],
                 consumed=(
@@ -403,6 +456,8 @@ class KVCacheManager:
                     else []
                 ),
             )
+            self.prefix_queries += 1
+            self.prefix_hits += length
             return True
         if len(prefix) > pages:
             raise ValueError("prefix exceeds initial KV frontier")
@@ -419,12 +474,16 @@ class KVCacheManager:
             for d in range(self.storage_depths)
         )
         length = len(prefix) * self.block_size
+        # A hit restores exactly the coverage publish_prefix required.
         self._allocations[request_id] = _Allocation(
             int(max_tokens),
             tables,
             [
-                [_WrittenPositions(prefix=length) for _ in range(self.num_layers)]
-                for _ in range(self.storage_depths)
+                [
+                    _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
+                    for layer in range(self.num_layers)
+                ]
+                for plane in range(self.storage_depths)
             ],
         )
         self.prefix_queries += 1
