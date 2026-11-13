@@ -18,13 +18,17 @@ class CacheConfig:
     memory_reserve_bytes: int = 256 * 1024 * 1024
     enable_prefix_caching: bool = False
     incremental_allocation: bool = False
+    # Ordinary fixed-loop grouped KV only; return expired SWA pages to the pool.
+    reclaim_swa: bool = False
     # Admission headroom for incremental allocation; otherwise effective watermark is zero.
     watermark_ratio: float = 0.0
 
     def __post_init__(self):
-        for name in ("enable_prefix_caching", "incremental_allocation"):
+        for name in ("enable_prefix_caching", "incremental_allocation", "reclaim_swa"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
+        if self.reclaim_swa and not self.incremental_allocation:
+            raise ValueError("reclaim_swa requires incremental_allocation")
         if not 0 <= self.watermark_ratio < 1:
             raise ValueError("watermark_ratio must be in [0, 1)")
         if self.enable_prefix_caching and self.layout != "last_exited":
