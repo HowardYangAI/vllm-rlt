@@ -206,7 +206,29 @@ block-aligned prompts, diverging suffixes, concurrent sharers and a
 re-request after its prefix was evicted all reproduce the cold greedy tokens,
 and publication refuses pages missing any owned plane. Prefix pages stay
 pinned for the life of the cache entry. Prefix tests run on both the legacy
-all-layer blocks and grouped storage.
+all-layer blocks and grouped storage. On a small FP32 model, prefix hits and
+diverging branches match the oracle in sync eager, sync Graph, async eager and
+async Graph modes.
+
+Real checkpoint, one L20, two loops, 16 greedy tokens, `prefill_chunk_size=256`,
+prompts cut from the model card. Each cell compares prefix caching on and off in
+a fresh engine; time to first token in seconds:
+
+| Prompt tokens | Request | TTFT off | TTFT on | Tokens equal (BF16) |
+| --- | --- | --- | --- | --- |
+| 1100 | repeat | 15.3 | 0.30 | yes |
+| 1100 | branch | 15.2 | 0.60 | yes |
+| 4096 | repeat | 60.4 | 0.41 | yes |
+| 4096 | branch | 60.3 | 0.78 | yes |
+
+An evicted prefix falls back to a cold prefill with equal tokens, and a control
+without eviction hits 1088 tokens. In BF16, one of four concurrent sharers and a
+seeded sampled (temperature 0.8) repeat differed from the uncached run; in FP32
+all of them match. A hit resumes prefill at the cached offset, which changes
+the chunk split, and with caching off, changing `prefill_chunk_size` alone
+already changes BF16 greedy tokens. As for batch shape in the execution modes,
+FP32 is the exact check and BF16 agreement is not promised across chunk splits.
+These are single runs on a shared host.
 
 ### CUDA
 
