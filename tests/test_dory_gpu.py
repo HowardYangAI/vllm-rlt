@@ -169,13 +169,10 @@ def test_plan_cache_profiles_dory_on_cuda():
     # The probe ran the real staged path, including windowed boundary attention.
     assert plan["source"] == "cuda_profile"
     config = model.config
+    # Grouped storage budgets one physical attention-layer page per block.
+    assert plan["block_unit"] == "physical_layer_page"
     assert plan["bytes_per_block"] == (
-        2
-        * config.num_kv_layers
-        * cache.block_size
-        * config.num_key_value_heads
-        * config.head_dim
-        * 4
+        2 * cache.block_size * config.num_key_value_heads * config.head_dim * 4
     )
 
 
@@ -288,3 +285,27 @@ def test_dory_failed_submission_releases_kv_in_every_execution_mode(mode, monkey
     engine.add_request("a", PROMPTS["a"], params)
     assert drain(engine)["a"].token_ids == greedy_reference(reference, PROMPTS["a"], 4)
     assert engine.cache_manager.num_used_blocks == 0
+
+
+@pytest.mark.parametrize("mode", EXECUTION_MODES)
+def test_dory_prefix_hits_match_cpu_oracle_in_every_execution_mode(mode):
+    """Prefix reuse composes with Graph replay and async submission: a cache hit
+    and a diverging branch serve the same greedy tokens as the dense oracle."""
+    reference, model = reference_pair()
+    engine = LLMEngine(
+        model,
+        attention_backend="triton",
+        cache_config=CacheConfig(num_blocks=512, block_size=2, enable_prefix_caching=True),
+        scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=16),
+        execution_config=ExecutionConfig(**EXECUTION_MODES[mode]),
+    )
+    params = SamplingParams(max_tokens=6, min_loops=2, max_loops=2, ignore_eos=True)
+    prompt = PROMPTS["c"]
+    branch = prompt[:6] + [4, 9, 1]
+    cache = engine.cache_manager
+    for request_id, tokens in (("cold", prompt), ("hit", prompt), ("branch", branch)):
+        engine.add_request(request_id, tokens, params)
+        output = drain(engine)[request_id]
+        assert output.token_ids == greedy_reference(reference, tokens, 6)
+    assert cache.prefix_hits > 0
+    assert cache.num_used_blocks == 0

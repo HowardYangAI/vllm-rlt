@@ -192,6 +192,15 @@ class StageEngine:
                 sliding_window=getattr(model, "requires_sliding_window", False),
             ),
         )
+        layer_windows = getattr(model, "kv_layer_windows", None)
+        if layer_windows is not None and (
+            self.execution_config.cuda_graphs or self.execution_config.async_scheduling
+        ):
+            # Graph and async execution borrow device-owned metadata, which
+            # grouped pages do not provide yet; use all-layer blocks instead.
+            if cache_config.reclaim_swa:
+                raise ValueError("SWA reclamation requires synchronous eager execution")
+            layer_windows = None
         num_blocks, self.memory_plan = plan_cache(
             model,
             cache_config,
@@ -200,11 +209,14 @@ class StageEngine:
             attention.info["selected_backend"],
             speculative=speculative_config,
             staged_prefill=staged_prefill,
+            # Pass the override only when grouped storage was turned off.
+            **(
+                {"layer_windows": None}
+                if layer_windows is None and getattr(model, "kv_layer_windows", None) is not None
+                else {}
+            ),
         )
-        if (
-            getattr(model, "kv_layer_windows", None) is not None
-            and scheduler_config.enable_preemption
-        ):
+        if layer_windows is not None and scheduler_config.enable_preemption:
             raise NotImplementedError("grouped KV does not support preemption snapshots")
         self.cache_manager = KVCacheManager(
             num_layers=getattr(config, "num_kv_layers", config.num_hidden_layers),
@@ -222,7 +234,7 @@ class StageEngine:
             incremental_allocation=cache_config.incremental_allocation,
             watermark_ratio=cache_config.watermark_ratio,
             recurrent_layers=getattr(model, "recurrent_kv_layers", None),
-            layer_windows=getattr(model, "kv_layer_windows", None),
+            layer_windows=layer_windows,
             reclaim_swa=cache_config.reclaim_swa,
             max_submission_tokens=min(
                 scheduler_config.prefill_chunk_size, scheduler_config.max_num_batched_tokens

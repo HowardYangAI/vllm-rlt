@@ -94,6 +94,11 @@ Reclamation supports ordinary synchronous fixed-loop `ouro` execution. Each
 all layers in their group have consumed the range and the submission completes.
 Full-attention history remains resident.
 
+CUDA Graphs and asynchronous scheduling borrow device-owned KV metadata, which
+grouped pages do not provide yet. With either switch on, the engine keeps
+all-layer blocks instead of grouped pages, prefix caching included, and rejects
+`reclaim_swa`.
+
 Native SWA attention stages only the needed page-aligned read span. Logical token
 positions, write addresses and public layer maps remain absolute; the backend's
 read-table context lengths are local to that span. Native attention calls must
