@@ -180,23 +180,23 @@ Sliding-window masking exists in the Torch reference backend and in the Triton
 decode kernel (`window=` on `KVCacheManager.attend`). Backend selection requires
 the `sliding_window` capability, so a Flash-backed Dory engine fails at
 construction instead of attending full history. Masking accepts host-planned,
-graph-private and device-owned metadata; storage reclamation of out-of-window
-pages stays with 2B. Optional physical SWA page reclamation is available on the grouped Torch path described above.
+graph-private and device-owned metadata. Physical reclamation of out-of-window
+pages is the optional grouped Torch path described above.
 
 ## Validation status
 
 `tests/test_dory.py` and `tests/test_dory_gpu.py` hold the regression suites;
 `tests/test_dory_real_checkpoint.py` holds the pinned-weight run. Measured
 results are below, including what they do not cover.
+
 ### CPU suite
 
-`tests/test_dory.py` (44 cases) covers configuration validation, strict loading
+`tests/test_dory.py` (66 cases) covers configuration validation, strict loading
 with single-file and sharded checkpoints, stage/KV contracts, sliding-window
 masking, KV layer compaction, engine scheduling, EOS stopping, and numerical
 agreement with an independent dense oracle (`tests/reference/dory.py`) for both
 KV modes — including greedy generation against that oracle. The full CPU run is
-945 passed with only the pre-existing failures of the reviewed baseline
-(`test_ouro` packed prefill, one `test_pd`, eleven `test_serving`).
+999 passed and 743 skipped, with no failures.
 
 ### Prefix reuse
 
@@ -226,13 +226,38 @@ without eviction hits 1088 tokens. In BF16, one of four concurrent sharers and a
 seeded sampled (temperature 0.8) repeat differed from the uncached run; in FP32
 all of them match. A hit resumes prefill at the cached offset, which changes
 the chunk split, and with caching off, changing `prefill_chunk_size` alone
-already changes BF16 greedy tokens. As for batch shape in the execution modes,
-FP32 is the exact check and BF16 agreement is not promised across chunk splits.
-These are single runs on a shared host.
+already changes BF16 greedy tokens. FP32 is therefore the exact check; BF16
+agreement is not promised across chunk splits. These are single runs on a
+shared host.
+
+The same checks were repeated on one RTX PRO 5000 Blackwell (torch 2.13+cu130,
+Torch backend), BF16, at loops 1, 2 and 4:
+
+| Loops | Prompt tokens | TTFT off | TTFT on (repeat) |
+| --- | --- | --- | --- |
+| 1 | 1100 | 6.6 | 0.13 |
+| 1 | 4096 | 27.9 | 0.20 |
+| 2 | 1100 | 9.3 | 0.18 |
+| 2 | 4096 | 40.9 | 0.29 |
+| 4 | 1100 | 16.4 | 0.31 |
+| 4 | 4096 | 69.9 | 0.49 |
+
+Repeat tokens were equal everywhere; eviction and its 1088-token control
+behaved as on the L20. At two loops and 1100 tokens in FP32, all eight
+concurrent requests, the seeded sampled repeat, every `prefill_chunk_size`
+from 16 to 256 and the cache hit produced identical tokens.
+
+With the Triton backend at two loops and 1100 tokens, sync eager, sync Graph,
+async eager and async Graph each produced the uncached tokens for the cold,
+repeat and branch requests, with the hit cutting time to first token from
+0.54-0.79 s to 0.06-0.10 s. Through the OpenAI-compatible HTTP server (1516
+prompt tokens), every request succeeded and hits cut time to first token from
+1.5-7 s to 0.09-0.35 s; the branch and one concurrent response differed in
+BF16 text, which is the chunk-split effect above.
 
 ### CUDA
 
-`tests/test_dory_gpu.py` (66 cases) checks the Triton backend against the Torch
+`tests/test_dory_gpu.py` (106 cases, including the execution-mode cases below) checks the Triton backend against the Torch
 reference: windowed decode for `head_dim` 8/128/256, windows 1/3/16/64 and
 lengths 1/7/63/64/65; unwindowed decode unchanged; both KV modes against the
 dense oracle; a greedy engine run whose tokens match the oracle; and
