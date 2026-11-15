@@ -416,79 +416,67 @@ class KVCacheManager:
         if not 0 < initial_tokens <= max_tokens:
             raise ValueError("invalid initial KV frontier")
         pages = (initial_tokens + self.block_size - 1) // self.block_size
+        if len(prefix) > pages:
+            raise ValueError("prefix exceeds initial KV frontier")
+        claimed = [b for bundle in prefix for b in bundle]
+        for b in claimed:
+            self._refs[b] += 1
         if self.grouped:
-            if len(prefix) > pages:
-                raise ValueError("prefix exceeds initial KV frontier")
-            claimed = [b for page in prefix for b in page]
-            for b in claimed:
-                self._refs[b] += 1
-            fresh = self._claim((pages - len(prefix)) * self.pages_per_token_block)
-            if fresh is None:
-                self._drop_refs(claimed)
-                return False
-            tables = self._group_tables(fresh, pages - len(prefix))
+            tables = self._claim_group_tables(pages - len(prefix))
+        else:
+            tail = pages - len(prefix)
+            blocks = self._claim(tail * self.storage_depths)
+            tables = (
+                None
+                if blocks is None
+                else tuple(
+                    tuple(g[d] for g in prefix) + tuple(blocks[d * tail : (d + 1) * tail])
+                    for d in range(self.storage_depths)
+                )
+            )
+        if tables is None:
+            self._drop_refs(claimed)
+            return False
+        length = len(prefix) * self.block_size
+        if self.grouped:
             for page in reversed(prefix):
                 head = self._group_tables(page, 1)
                 tables = tuple(
                     tuple(h + t for h, t in zip(head_planes, planes))
                     for head_planes, planes in zip(head, tables)
                 )
-            length = len(prefix) * self.block_size
-            self._allocations[request_id] = _Allocation(
-                int(max_tokens),
-                (),
-                [
-                    [
-                        _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
-                        for layer in range(self.num_layers)
-                    ]
-                    for plane in range(self.storage_depths)
-                ],
-                group_tables=tables,
-                group_epochs=[[0] * group.planes for group in self.groups],
-                retired_pages=[[0] * group.planes for group in self.groups],
-                consumed=(
-                    [
-                        [_WrittenPositions() for _ in range(self.num_layers)]
-                        for _ in range(self.storage_depths)
-                    ]
-                    if self.reclaim_swa
-                    else []
-                ),
-            )
-            self.prefix_queries += 1
-            self.prefix_hits += length
-            return True
-        if len(prefix) > pages:
-            raise ValueError("prefix exceeds initial KV frontier")
-        claimed = [b for group in prefix for b in group]
-        for b in claimed:
-            self._refs[b] += 1
-        fresh = self._claim((pages - len(prefix)) * self.storage_depths)
-        if fresh is None:
-            self._drop_refs(claimed)
-            return False
-        tail = pages - len(prefix)
-        tables = tuple(
-            tuple(g[d] for g in prefix) + tuple(fresh[d * tail : (d + 1) * tail])
-            for d in range(self.storage_depths)
-        )
-        length = len(prefix) * self.block_size
         # A hit restores exactly the coverage publish_prefix required.
+        written = [
+            [
+                _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
+                for layer in range(self.num_layers)
+            ]
+            for plane in range(self.storage_depths)
+        ]
         self._allocations[request_id] = _Allocation(
             int(max_tokens),
-            tables,
-            [
+            () if self.grouped else tables,
+            written,
+            group_tables=tables if self.grouped else (),
+            group_epochs=[[0] * group.planes for group in self.groups],
+            retired_pages=[[0] * group.planes for group in self.groups],
+            consumed=(
                 [
-                    _WrittenPositions(prefix=length if self._plane_owns(plane, layer) else 0)
-                    for layer in range(self.num_layers)
+                    [_WrittenPositions() for _ in range(self.num_layers)]
+                    for _ in range(self.storage_depths)
                 ]
-                for plane in range(self.storage_depths)
-            ],
+                if self.reclaim_swa
+                else []
+            ),
         )
         self.prefix_queries += 1
         self.prefix_hits += length
         return True
+
+    def _claim_group_tables(self, pages):
+        """Claim ``pages`` logical pages per group, or None if the pool is short."""
+        fresh = self._claim(pages * self.pages_per_token_block)
+        return None if fresh is None else self._group_tables(fresh, pages)
 
     def ensure_capacity(self, request_id, tokens):
         allocation = self._get_allocation(request_id)
@@ -500,10 +488,9 @@ class KVCacheManager:
             extra = pages - current
             if extra <= 0:
                 return True
-            fresh = self._claim(extra * self.pages_per_token_block)
-            if fresh is None:
+            added = self._claim_group_tables(extra)
+            if added is None:
                 return False
-            added = self._group_tables(fresh, extra)
             allocation.group_tables = tuple(
                 tuple(table + tail for table, tail in zip(planes, new_planes))
                 for planes, new_planes in zip(allocation.group_tables, added)
@@ -531,8 +518,7 @@ class KVCacheManager:
         admission reservation; stale bytes are hidden by written/context lengths.
         Shared prompt pages must never be truncated or subsequently overwritten.
         """
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if type(frontier) is not int or not 0 <= frontier <= allocation.max_tokens:
             raise ValueError("invalid KV truncation frontier")
@@ -566,8 +552,7 @@ class KVCacheManager:
                 self._drop_refs(b for table in allocation.block_tables for b in reversed(table))
 
     def pin_transfer(self, request_id: str, transfer_id: str):
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.release_requested:
             raise RuntimeError("cannot transfer KV scheduled for release")
@@ -581,8 +566,7 @@ class KVCacheManager:
 
     def mark_imported_prefix(self, request_id: str, length: int, *, start=0):
         """Publish received KV only after the connector confirms remote writes are complete."""
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if type(length) is not int or not 0 < length <= allocation.max_tokens:
             raise ValueError("imported prefix exceeds reserved capacity")
@@ -614,8 +598,7 @@ class KVCacheManager:
         return len(allocation.block_tables[0]) * self.storage_depths
 
     def get_block_table(self, request_id: str, depth: int) -> tuple[int, ...]:
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         self._validate_depth(depth)
         return self._get_allocation(request_id).block_tables[self._plane(depth)]
 
@@ -626,8 +609,7 @@ class KVCacheManager:
         ``max_loops`` planes and SHARED has one, so ``tables[2]`` fails under
         SHARED while ``get_block_table(rid, 2)`` works under both layouts.
         """
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         return self._get_allocation(request_id).block_tables
 
     def has_transfer_lease(self, request_id: str) -> bool:
@@ -650,13 +632,13 @@ class KVCacheManager:
         return self._token_written(allocation, position, depth)
 
     def _token_written(self, allocation: _Allocation, position: int, depth: int) -> bool:
-        plane = allocation.written[self._plane(depth)]
         if self.grouped:
             return all(
-                position in allocation.written[self._plane(depth) if group.recurrent else 0][layer]
+                position in allocation.written[self._group_plane(group, depth)][layer]
                 for group in self.groups
                 for layer in group.layers
             )
+        plane = allocation.written[self._plane(depth)]
         return all(position in plane[layer] for layer in range(self.num_layers))
 
     def exit_written(self, request_id: str, position: int, depth: int) -> bool:
@@ -709,8 +691,7 @@ class KVCacheManager:
         Copying page by page avoids a request-sized temporary on a device
         that is already full, which is exactly when preemption happens.
         """
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.transfer_leases:
             raise RuntimeError("cannot snapshot KV during a transfer")
@@ -735,8 +716,7 @@ class KVCacheManager:
         decision belongs to the scheduler. The copies go on the current
         stream; the caller decides when other streams may read them.
         """
-        if self.grouped:
-            raise NotImplementedError("grouped KV supports ordinary layer views only")
+        self._require_legacy()
         allocation = self._get_allocation(request_id)
         if allocation.max_tokens != snapshot.max_tokens:
             raise ValueError("snapshot capacity does not match the allocation")
@@ -766,13 +746,16 @@ class KVCacheManager:
         assert cursor == len(blocks)
         return tuple(result)
 
+    def _group_plane(self, group: KVGroup, depth: int) -> int:
+        """Storage plane owning ``depth`` for ``group``; boundary layers keep depth 0."""
+        return self._plane(depth) if group.recurrent else 0
+
     def _group_table(self, allocation, layer, depth):
         group_id, local = self.layer_groups[layer]
         group = self.groups[group_id]
         if not group.recurrent and depth != 0:
             raise ValueError("boundary attention layers only own depth zero")
-        plane = self._plane(depth) if group.recurrent else 0
-        return allocation.group_tables[group_id][plane], local
+        return allocation.group_tables[group_id][self._group_plane(group, depth)], local
 
     def _layer_table(self, allocation, layer, depth):
         bundles, local = self._group_table(allocation, layer, depth)
@@ -811,8 +794,7 @@ class KVCacheManager:
         group_id, _ = self.layer_groups[layer]
         group = self.groups[group_id]
         epochs = tuple(
-            a.group_epochs[group_id][self._plane(d) if group.recurrent else 0]
-            for a, d, _ in batch.rows
+            a.group_epochs[group_id][self._group_plane(group, d)] for a, d, _ in batch.rows
         )
         cached = batch.layer_views.get(layer)
         if cached is not None and cached[0] == epochs:
@@ -865,10 +847,8 @@ class KVCacheManager:
         allocation = self._get_allocation(request_id)
         start = 0
         if self.grouped:
-            self._group_table(allocation, layer, depth)
             group_id, _ = self.layer_groups[layer]
-            group = self.groups[group_id]
-            plane = self._plane(depth) if group.recurrent else 0
+            plane = self._group_plane(self.groups[group_id], depth)
             start = allocation.retired_pages[group_id][plane] * self.block_size
         return start, allocation.written[self._plane(depth)][layer].prefix
 
@@ -943,6 +923,15 @@ class KVCacheManager:
 
     def _plane(self, depth: int) -> int:
         return depth if self.layout == "last_exited" else 0
+
+    def _storage(self, layer: int) -> int:
+        """Physical page slot holding ``layer``; grouped pages hold exactly one."""
+        return 0 if self.grouped else layer
+
+    def _require_legacy(self) -> None:
+        """Reject views that name an all-layer block; grouped pages have none."""
+        if self.grouped:
+            raise NotImplementedError("grouped KV supports ordinary layer views only")
 
     def _get_allocation(self, request_id: str) -> _Allocation:
         try:
@@ -1126,7 +1115,7 @@ class KVCacheManager:
         self._validate_tensor(v, len(batch.position_ids), "v")
         if not batch.rows:
             return
-        storage_layer = 0 if self.grouped else layer
+        storage_layer = self._storage(layer)
         self.key_cache[batch.write_blocks, storage_layer, batch.write_offsets] = k[
             : len(batch.rows)
         ]
@@ -1199,8 +1188,8 @@ class KVCacheManager:
         if batch.cu_seqlens_q is not None:
             return self.attention.prefill(
                 q,
-                self.key_cache[:, 0 if self.grouped else layer],
-                self.value_cache[:, 0 if self.grouped else layer],
+                self.key_cache[:, self._storage(layer)],
+                self.value_cache[:, self._storage(layer)],
                 batch.block_tables,
                 batch.context_lengths,
                 batch.cu_seqlens_q,
@@ -1208,8 +1197,8 @@ class KVCacheManager:
             )
         return self.attention(
             q,
-            self.key_cache[:, 0 if self.grouped else layer],
-            self.value_cache[:, 0 if self.grouped else layer],
+            self.key_cache[:, self._storage(layer)],
+            self.value_cache[:, self._storage(layer)],
             batch.block_tables,
             batch.context_lengths,
         )
@@ -1240,8 +1229,8 @@ class KVCacheManager:
                 self._require_prefix(allocation, layer, depth, position + 1)
         return self.attention.windowed(
             q,
-            self.key_cache[:, 0 if self.grouped else layer],
-            self.value_cache[:, 0 if self.grouped else layer],
+            self.key_cache[:, self._storage(layer)],
+            self.value_cache[:, self._storage(layer)],
             batch.block_tables,
             batch.context_lengths,
             window,
@@ -1327,7 +1316,7 @@ class KVCacheManager:
         )
         blocks = table[positions // self.block_size]
         offsets = positions % self.block_size
-        storage_layer = 0 if self.grouped else layer
+        storage_layer = self._storage(layer)
         return (
             self.key_cache[blocks, storage_layer, offsets],
             self.value_cache[blocks, storage_layer, offsets],

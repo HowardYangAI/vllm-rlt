@@ -209,12 +209,7 @@ class StageEngine:
             attention.info["selected_backend"],
             speculative=speculative_config,
             staged_prefill=staged_prefill,
-            # Pass the override only when grouped storage was turned off.
-            **(
-                {"layer_windows": None}
-                if layer_windows is None and getattr(model, "kv_layer_windows", None) is not None
-                else {}
-            ),
+            layer_windows=layer_windows,
         )
         if layer_windows is not None and scheduler_config.enable_preemption:
             raise NotImplementedError("grouped KV does not support preemption snapshots")
